@@ -12,7 +12,7 @@ defmodule Forgelet.Repository do
 
   require Logger
 
-  alias Forgelet.{Event, EventStore}
+  alias Forgelet.{Event, EventStore, Git}
 
   # ---------------------------------------------------------------------------
   # Client API
@@ -45,6 +45,34 @@ defmodule Forgelet.Repository do
   """
   def get_state(repo_id) do
     GenServer.call(via(repo_id), :get_state)
+  end
+
+  @doc """
+  Returns open, unclaimed intents for a repository.
+  """
+  def list_open_intents(repo_id) do
+    GenServer.call(via(repo_id), :list_open_intents)
+  end
+
+  @doc """
+  Returns proposals still pending review for a repository.
+  """
+  def list_active_proposals(repo_id) do
+    GenServer.call(via(repo_id), :list_active_proposals)
+  end
+
+  @doc """
+  Reserves an intent claim before the authoring agent emits the signed event.
+  """
+  def reserve_intent_claim(repo_id, intent_ref, agent_id) do
+    GenServer.call(via(repo_id), {:reserve_intent_claim, intent_ref, agent_id})
+  end
+
+  @doc """
+  Releases an intent claim reservation if event publication fails.
+  """
+  def release_intent_claim(repo_id, intent_ref, agent_id) do
+    GenServer.call(via(repo_id), {:release_intent_claim, intent_ref, agent_id})
   end
 
   @doc """
@@ -92,6 +120,8 @@ defmodule Forgelet.Repository do
       {output, _} -> Logger.warning("Repository: git init --bare failed: #{output}")
     end
 
+    ensure_initial_commit(path)
+
     scope = {:repo, repo_id}
 
     Phoenix.PubSub.subscribe(Forgelet.PubSub, "events:scope:repo:#{hex_id}")
@@ -110,7 +140,10 @@ defmodule Forgelet.Repository do
        owner: owner,
        policy: policy,
        active_intents: %{},
+       intent_claims: %{},
+       reserved_claims: %{},
        active_proposals: %{},
+       proposal_statuses: %{},
        agents: MapSet.new(),
        scope: scope,
        created_at: System.os_time(:millisecond)
@@ -136,15 +169,59 @@ defmodule Forgelet.Repository do
     {:noreply, state}
   end
 
+  def handle_info({:event, %{kind: :intent_published} = event}, state) do
+    intent_ref = Event.ref(event)
+    {:noreply, %{state | active_intents: Map.put(state.active_intents, intent_ref, event)}}
+  end
+
   def handle_info({:event, %{kind: :intent_claimed} = event}, state) do
     agent_key = event.author
-    {:noreply, %{state | agents: MapSet.put(state.agents, agent_key)}}
+    intent_ref = event.payload["intent_ref"]
+
+    updated_claims =
+      if is_binary(intent_ref) do
+        Map.put(state.intent_claims, intent_ref, agent_key)
+      else
+        state.intent_claims
+      end
+
+    updated_reservations =
+      if is_binary(intent_ref) do
+        Map.delete(state.reserved_claims, intent_ref)
+      else
+        state.reserved_claims
+      end
+
+    {:noreply,
+     %{
+       state
+       | agents: MapSet.put(state.agents, agent_key),
+         intent_claims: updated_claims,
+         reserved_claims: updated_reservations
+     }}
   end
 
   def handle_info({:event, %{kind: :proposal_submitted} = event}, state) do
     # Store proposals by hex-encoded ref for consistent matching
     proposal_ref = Event.ref(event)
-    {:noreply, %{state | active_proposals: Map.put(state.active_proposals, proposal_ref, event)}}
+
+    {:noreply,
+     %{
+       state
+       | active_proposals: Map.put(state.active_proposals, proposal_ref, event),
+         proposal_statuses: Map.put(state.proposal_statuses, proposal_ref, :pending)
+     }}
+  end
+
+  def handle_info({:event, %{kind: :proposal_withdrawn} = event}, state) do
+    proposal_ref = event.payload["proposal_ref"]
+
+    {:noreply,
+     %{
+       state
+       | active_proposals: Map.delete(state.active_proposals, proposal_ref),
+         proposal_statuses: Map.put(state.proposal_statuses, proposal_ref, :withdrawn)
+     }}
   end
 
   def handle_info({:event, %{kind: :consensus_reached} = event}, state) do
@@ -152,26 +229,16 @@ defmodule Forgelet.Repository do
     outcome = event.payload["outcome"]
 
     if Map.has_key?(state.active_proposals, proposal_ref) do
-      result_kind =
-        if outcome in [:accepted, "accepted"], do: :merge_executed, else: :merge_rejected
+      proposal_event = Map.fetch!(state.active_proposals, proposal_ref)
+      append_merge_result(state, proposal_ref, outcome, proposal_event)
 
-      case Event.new(result_kind, state.owner, %{"proposal_ref" => proposal_ref},
-             scope: state.scope
-           ) do
-        {:ok, result_event} ->
-          case EventStore.append(result_event) do
-            {:ok, _} ->
-              :ok
-
-            {:error, reason} ->
-              Logger.warning("Repository: failed to append #{result_kind}: #{inspect(reason)}")
-          end
-
-        {:error, reason} ->
-          Logger.warning("Repository: failed to create #{result_kind} event: #{inspect(reason)}")
-      end
-
-      {:noreply, %{state | active_proposals: Map.delete(state.active_proposals, proposal_ref)}}
+      {:noreply,
+       %{
+         state
+         | active_proposals: Map.delete(state.active_proposals, proposal_ref),
+           proposal_statuses:
+             Map.put(state.proposal_statuses, proposal_ref, normalize_outcome(outcome))
+       }}
     else
       {:noreply, state}
     end
@@ -185,12 +252,62 @@ defmodule Forgelet.Repository do
     {:reply, sanitized, state}
   end
 
+  def handle_call(:list_open_intents, _from, state) do
+    intents =
+      state.active_intents
+      |> Enum.reject(fn {intent_ref, _event} ->
+        Map.has_key?(state.intent_claims, intent_ref) or
+          Map.has_key?(state.reserved_claims, intent_ref)
+      end)
+      |> Enum.map(fn {_intent_ref, event} -> event end)
+
+    {:reply, intents, state}
+  end
+
+  def handle_call(:list_active_proposals, _from, state) do
+    proposals =
+      state.active_proposals
+      |> Enum.filter(fn {proposal_ref, _event} ->
+        Map.get(state.proposal_statuses, proposal_ref, :pending) == :pending
+      end)
+      |> Enum.map(fn {_proposal_ref, event} -> event end)
+
+    {:reply, proposals, state}
+  end
+
+  def handle_call({:reserve_intent_claim, intent_ref, agent_id}, _from, state) do
+    cond do
+      not Map.has_key?(state.active_intents, intent_ref) ->
+        {:reply, {:error, :intent_not_found}, state}
+
+      Map.has_key?(state.intent_claims, intent_ref) ->
+        {:reply, {:error, :already_claimed}, state}
+
+      Map.has_key?(state.reserved_claims, intent_ref) ->
+        {:reply, {:error, :already_claimed}, state}
+
+      true ->
+        {:reply, :ok,
+         %{state | reserved_claims: Map.put(state.reserved_claims, intent_ref, agent_id)}}
+    end
+  end
+
+  def handle_call({:release_intent_claim, intent_ref, agent_id}, _from, state) do
+    reserved_by = Map.get(state.reserved_claims, intent_ref)
+
+    if reserved_by == agent_id do
+      {:reply, :ok, %{state | reserved_claims: Map.delete(state.reserved_claims, intent_ref)}}
+    else
+      {:reply, :ok, state}
+    end
+  end
+
   def handle_call({:publish_intent, keypair, payload}, _from, state) do
     case Event.new(:intent_published, keypair, payload, scope: state.scope) do
       {:ok, event} ->
         case EventStore.append(event) do
           {:ok, _} ->
-            updated_intents = Map.put(state.active_intents, event.id, event)
+            updated_intents = Map.put(state.active_intents, Event.ref(event), event)
             {:reply, {:ok, event}, %{state | active_intents: updated_intents}}
 
           {:error, _} = error ->
@@ -199,6 +316,147 @@ defmodule Forgelet.Repository do
 
       {:error, _} = error ->
         {:reply, error, state}
+    end
+  end
+
+  defp normalize_outcome(outcome) when outcome in [:accepted, "accepted"], do: :accepted
+  defp normalize_outcome(outcome) when outcome in [:rejected, "rejected"], do: :rejected
+  defp normalize_outcome(_outcome), do: :pending
+
+  defp append_merge_result(state, proposal_ref, outcome, proposal_event) do
+    result =
+      if outcome in [:accepted, "accepted"] do
+        execute_merge(state, proposal_ref, proposal_event)
+      else
+        {:ok, :merge_rejected,
+         %{"proposal_ref" => proposal_ref, "reason" => "consensus_rejected"}}
+      end
+
+    case result do
+      {:ok, result_kind, payload} ->
+        append_repo_event(state, result_kind, payload)
+
+      {:error, reason} ->
+        append_repo_event(state, :merge_rejected, %{
+          "proposal_ref" => proposal_ref,
+          "reason" => inspect(reason)
+        })
+    end
+  end
+
+  defp execute_merge(state, proposal_ref, proposal_event) do
+    with %{"artifact" => artifact} <- proposal_event.payload,
+         {:ok, branch_name} <- mergeable_branch_name(artifact),
+         {:ok, new_head} <- merge_branch_into_main(state.path, branch_name) do
+      append_repo_event(state, :repo_ref_updated, %{
+        "proposal_ref" => proposal_ref,
+        "branch" => Git.default_branch(),
+        "head" => new_head
+      })
+
+      {:ok, :merge_executed,
+       %{"proposal_ref" => proposal_ref, "branch" => branch_name, "head" => new_head}}
+    else
+      nil -> {:error, :missing_artifact}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp mergeable_branch_name(%{"type" => "branch", "name" => branch_name})
+       when is_binary(branch_name) do
+    {:ok, branch_name}
+  end
+
+  defp mergeable_branch_name(%{"type" => "commit_range"}) do
+    {:error, :commit_range_merge_not_supported}
+  end
+
+  defp mergeable_branch_name(_artifact), do: {:error, :unsupported_artifact}
+
+  defp merge_branch_into_main(bare_repo_path, branch_name) do
+    tmp_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "forgelet-merge-#{System.unique_integer([:positive, :monotonic])}"
+      )
+
+    File.mkdir_p!(tmp_dir)
+
+    try do
+      with :ok <- Git.clone(bare_repo_path, tmp_dir),
+           :ok <- Git.configure_identity(tmp_dir, "Forgelet", "forgelet@example.local"),
+           :ok <- Git.fetch_all(tmp_dir),
+           :ok <-
+             Git.checkout_branch(tmp_dir, Git.default_branch(), "origin/#{Git.default_branch()}"),
+           :ok <- Git.merge_remote_branch(tmp_dir, branch_name),
+           :ok <- Git.push_ref(tmp_dir, Git.default_branch(), Git.default_branch()),
+           {:ok, head} <- Git.rev_parse(tmp_dir, "HEAD") do
+        {:ok, head}
+      end
+    after
+      File.rm_rf(tmp_dir)
+    end
+  end
+
+  defp append_repo_event(state, kind, payload) do
+    case Event.new(kind, state.owner, payload, scope: state.scope) do
+      {:ok, repo_event} ->
+        case EventStore.append(repo_event) do
+          {:ok, _} ->
+            :ok
+
+          {:error, reason} ->
+            Logger.warning("Repository: failed to append #{kind}: #{inspect(reason)}")
+        end
+
+      {:error, reason} ->
+        Logger.warning("Repository: failed to create #{kind}: #{inspect(reason)}")
+    end
+  end
+
+  defp ensure_initial_commit(bare_repo_path) do
+    tmp_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "forgelet-bootstrap-#{System.unique_integer([:positive, :monotonic])}"
+      )
+
+    File.mkdir_p!(tmp_dir)
+
+    try do
+      with {_, 0} <- System.cmd("git", ["clone", bare_repo_path, tmp_dir], stderr_to_stdout: true),
+           {_, 0} <-
+             System.cmd("git", ["config", "user.name", "Forgelet"],
+               cd: tmp_dir,
+               stderr_to_stdout: true
+             ),
+           {_, 0} <-
+             System.cmd("git", ["config", "user.email", "forgelet@example.local"],
+               cd: tmp_dir,
+               stderr_to_stdout: true
+             ),
+           {_, 0} <-
+             System.cmd("git", ["commit", "--allow-empty", "-m", "Initial commit"],
+               cd: tmp_dir,
+               stderr_to_stdout: true
+             ),
+           {_, 0} <-
+             System.cmd("git", ["push", "origin", "HEAD:main"],
+               cd: tmp_dir,
+               stderr_to_stdout: true
+             ),
+           {_, 0} <-
+             System.cmd("git", ["symbolic-ref", "HEAD", "refs/heads/main"],
+               cd: bare_repo_path,
+               stderr_to_stdout: true
+             ) do
+        :ok
+      else
+        {output, _code} ->
+          Logger.warning("Repository: initial commit bootstrap failed: #{output}")
+      end
+    after
+      File.rm_rf(tmp_dir)
     end
   end
 end

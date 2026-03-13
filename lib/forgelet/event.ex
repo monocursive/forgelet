@@ -33,6 +33,9 @@ defmodule Forgelet.Event do
     # Execution
     :merge_executed,
     :merge_rejected,
+    # Session lifecycle
+    :session_completed,
+    :session_failed,
     # Capabilities
     :capability_granted,
     :capability_revoked,

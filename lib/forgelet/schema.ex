@@ -26,6 +26,8 @@ defmodule Forgelet.Schema do
     :repo_ref_updated,
     :merge_executed,
     :merge_rejected,
+    :session_completed,
+    :session_failed,
     :validation_requested,
     :validation_result,
     :consensus_failed,

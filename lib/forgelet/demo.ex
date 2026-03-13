@@ -9,7 +9,8 @@ defmodule Forgelet.Demo do
   6. Consensus is reached and merge executes
   """
 
-  alias Forgelet.{Agent, Repository, Identity, Event, EventStore}
+  alias Forgelet.{Agent, Event, EventStore, Git, Identity, Repository}
+  alias Forgelet.Agent.Workspace
 
   def run do
     IO.puts("\n=== Forgelet Demo ===\n")
@@ -52,21 +53,46 @@ defmodule Forgelet.Demo do
     Process.sleep(200)
 
     # 4. Coder claims the intent and submits a proposal
-    {:ok, _claim_ref} = Agent.claim_intent(coder_pk, intent_ref, scope)
+    {:ok, _claim_ref} = Agent.claim_intent(coder_pk, repo_id, intent_ref, scope)
     IO.puts("[4/6] Coder claimed intent")
     Process.sleep(200)
+
+    {:ok, session_root} = Workspace.create_session_root()
+
+    artifact_data =
+      try do
+        {:ok, checkout} =
+          Workspace.prepare_task_checkout(session_root, repo_id, coder_pk, intent_ref)
+
+        feature_file = Path.join(checkout.repo_path, "FEDERATION.md")
+        File.write!(feature_file, "# Federation protocol\n\nInitial protocol sketch.\n")
+
+        {:ok, _commit_sha} = Git.commit_all(checkout.repo_path, "Add federation protocol sketch")
+        :ok = Git.push_branch(checkout.repo_path, checkout.branch_name)
+        {:ok, head_sha} = Git.rev_parse(checkout.repo_path, "HEAD")
+
+        %{
+          "affected_files" => ["FEDERATION.md"],
+          "artifact" => %{
+            "type" => "branch",
+            "name" => checkout.branch_name,
+            "head" => head_sha
+          }
+        }
+      after
+        Workspace.cleanup(session_root)
+      end
 
     {:ok, proposal_ref} =
       Agent.submit_proposal(
         coder_pk,
         %{
           "intent_ref" => intent_ref,
-          "commit_range" => %{"from" => "abc1234", "to" => "def5678"},
+          "repo_id" => repo_hex,
+          "summary" => "Add the initial federation protocol flow",
           "confidence" => 0.85,
-          "affected_files" => [
-            "lib/forgelet/federation.ex",
-            "lib/forgelet/federation/gossip.ex"
-          ]
+          "affected_files" => artifact_data["affected_files"],
+          "artifact" => artifact_data["artifact"]
         },
         scope
       )

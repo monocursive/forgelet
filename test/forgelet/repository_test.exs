@@ -1,7 +1,8 @@
 defmodule Forgelet.RepositoryTest do
   use Forgelet.DataCase
 
-  alias Forgelet.{Repository, EventStore, Identity}
+  alias Forgelet.{Agent, Event, EventStore, Git, Identity, Repository}
+  alias Forgelet.Agent.Workspace
 
   setup do
     owner = Identity.generate()
@@ -75,6 +76,92 @@ defmodule Forgelet.RepositoryTest do
 
       assert repo_id1 in repo_ids
       assert repo_id2 in repo_ids
+    end
+  end
+
+  describe "merge execution" do
+    test "accepted branch proposal updates main and emits repo_ref_updated", %{owner: owner} do
+      {:ok, _repo_pid, repo_id} = Repository.create("merge-repo", owner)
+      {:ok, _coder_pid, coder_id} = Agent.spawn(:coder)
+      repo_hex = Base.encode16(repo_id, case: :lower)
+
+      Process.sleep(100)
+
+      {:ok, intent_event} = Repository.publish_intent(repo_id, owner, %{"title" => "Merge me"})
+      intent_ref = Event.ref(intent_event)
+      assert {:ok, _claim_ref} = Agent.claim_intent(coder_id, repo_id, intent_ref)
+
+      {:ok, session_root} = Workspace.create_session_root()
+
+      artifact =
+        try do
+          {:ok, checkout} =
+            Workspace.prepare_task_checkout(session_root, repo_id, coder_id, intent_ref)
+
+          File.write!(Path.join(checkout.repo_path, "MERGE_TEST.md"), "merged\n")
+          {:ok, _commit_sha} = Git.commit_all(checkout.repo_path, "Add merge test file")
+          :ok = Git.push_branch(checkout.repo_path, checkout.branch_name)
+          {:ok, head_sha} = Git.rev_parse(checkout.repo_path, "HEAD")
+          %{"type" => "branch", "name" => checkout.branch_name, "head" => head_sha}
+        after
+          Workspace.cleanup(session_root)
+        end
+
+      {:ok, proposal_ref} =
+        Agent.submit_proposal(
+          coder_id,
+          %{
+            "intent_ref" => intent_ref,
+            "repo_id" => repo_hex,
+            "summary" => "Merge branch artifact",
+            "confidence" => 0.9,
+            "affected_files" => ["MERGE_TEST.md"],
+            "artifact" => artifact
+          },
+          {:repo, repo_id}
+        )
+
+      consensus_author = Identity.generate()
+
+      {:ok, consensus_event} =
+        Event.new(
+          :consensus_reached,
+          consensus_author,
+          %{"proposal_ref" => proposal_ref, "outcome" => "accepted"},
+          scope: {:repo, repo_id}
+        )
+
+      assert {:ok, _stored} = EventStore.append(consensus_event)
+      Process.sleep(200)
+
+      assert Enum.any?(
+               EventStore.by_kind(:merge_executed),
+               &(&1.payload["proposal_ref"] == proposal_ref)
+             )
+
+      repo_ref_event =
+        Enum.find(
+          EventStore.by_kind(:repo_ref_updated),
+          &(&1.payload["proposal_ref"] == proposal_ref)
+        )
+
+      assert repo_ref_event
+      assert repo_ref_event.payload["branch"] == "main"
+
+      verify_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "forgelet-verify-#{System.unique_integer([:positive, :monotonic])}"
+        )
+
+      File.mkdir_p!(verify_dir)
+
+      try do
+        assert :ok = Git.clone(Repository.get_state(repo_id).path, verify_dir)
+        assert File.exists?(Path.join(verify_dir, "MERGE_TEST.md"))
+      after
+        File.rm_rf(verify_dir)
+      end
     end
   end
 end

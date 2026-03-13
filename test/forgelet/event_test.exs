@@ -86,7 +86,7 @@ defmodule Forgelet.EventTest do
   describe "valid_kinds/0" do
     test "returns all expected event kinds including spec additions" do
       kinds = Event.valid_kinds()
-      assert length(kinds) == 27
+      assert length(kinds) == 29
 
       # Check that core kinds are present
       for kind <- [
@@ -108,6 +108,8 @@ defmodule Forgelet.EventTest do
             :consensus_failed,
             :merge_executed,
             :merge_rejected,
+            :session_completed,
+            :session_failed,
             :capability_granted,
             :capability_revoked,
             :repo_created,

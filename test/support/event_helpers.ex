@@ -31,7 +31,11 @@ defmodule Forgelet.EventHelpers do
     payload =
       Keyword.get(opts, :payload, %{
         "intent_ref" => intent_ref,
-        "commit_range" => %{"from" => "abc123", "to" => "def456"}
+        "repo_id" => Base.encode16(:crypto.strong_rand_bytes(16), case: :lower),
+        "summary" => "Test proposal",
+        "confidence" => 0.8,
+        "affected_files" => ["lib/example.ex"],
+        "artifact" => %{"type" => "commit_range", "from" => "abc123", "to" => "def456"}
       })
 
     build_event(:proposal_submitted, Keyword.put(opts, :payload, payload))

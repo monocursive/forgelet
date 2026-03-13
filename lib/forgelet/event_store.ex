@@ -29,6 +29,19 @@ defmodule Forgelet.EventStore do
     end
   end
 
+  def get_by_ref(ref, table \\ @default_table) when is_binary(ref) do
+    case Base.decode16(ref, case: :mixed) do
+      {:ok, id} ->
+        case get(id, table) do
+          {:ok, event} -> {:ok, event}
+          :error -> {:error, :not_found}
+        end
+
+      :error ->
+        {:error, :invalid_ref}
+    end
+  end
+
   def by_kind(kind, table \\ @default_table) do
     :ets.foldl(
       fn {_id, event}, acc ->
@@ -120,6 +133,7 @@ defmodule Forgelet.EventStore do
   defp persist_to_postgres(event) do
     record = EventRecord.to_record(event)
     now = DateTime.utc_now()
+    callers = Process.get(:"$callers", [])
 
     fields =
       record
@@ -128,7 +142,13 @@ defmodule Forgelet.EventStore do
       |> Map.put(:inserted_at, now)
       |> Map.put(:updated_at, now)
 
-    Repo.insert_all("events", [fields], on_conflict: :nothing)
+    opts =
+      case callers do
+        [caller | _] -> [on_conflict: :nothing, caller: caller]
+        [] -> [on_conflict: :nothing]
+      end
+
+    Repo.insert_all("events", [fields], opts)
     :ok
   rescue
     e ->
