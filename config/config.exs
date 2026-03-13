@@ -12,7 +12,21 @@ config :forgelet,
   generators: [timestamp_type: :utc_datetime, binary_id: true],
   repo_base_path: Path.expand("../priv/repos", __DIR__),
   bootstrap_peers: [],
-  default_consensus_policy: {:threshold, 2, 0.7}
+  default_consensus_policy: {:threshold, 2, 0.7},
+  claude_cli_path: System.get_env("CLAUDE_CLI_PATH", "claude"),
+  agent_models: %{
+    coder: "claude-sonnet-4-6",
+    reviewer: "claude-sonnet-4-6",
+    orchestrator: "claude-opus-4-6"
+  },
+  agent_budgets: %{
+    coder: %{timeout_ms: 600_000},
+    reviewer: %{timeout_ms: 300_000},
+    orchestrator: %{timeout_ms: 600_000}
+  },
+  session_workspace_base: Path.join(System.tmp_dir!(), "forgelet-sessions"),
+  default_test_command: ["mix", "test"],
+  mcp_public_base_url: System.get_env("FORGELET_MCP_BASE_URL", "http://localhost:4000")
 
 # Configure the endpoint
 config :forgelet, ForgeletWeb.Endpoint,

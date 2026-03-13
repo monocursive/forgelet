@@ -43,4 +43,8 @@ config :phoenix,
 # Forgelet test overrides
 config :forgelet,
   repo_base_path: Path.expand("../tmp/test_repos", __DIR__),
-  default_consensus_policy: {:threshold, 2, 0.7}
+  default_consensus_policy: {:threshold, 2, 0.7},
+  claude_cli_path: Path.expand("../test/support/mock_claude.sh", __DIR__),
+  session_workspace_base: Path.expand("../tmp/test_sessions", __DIR__),
+  default_test_command: ["sh", "-lc", "exit 0"],
+  mcp_public_base_url: "http://localhost:4002"

@@ -12,6 +12,7 @@ defmodule Forgelet.Agent do
   require Logger
 
   alias Forgelet.{Event, EventStore, Identity}
+  alias Forgelet.Agent.TaskContext
   alias Forgelet.Identity.Provenance
 
   # ---------------------------------------------------------------------------
@@ -60,8 +61,20 @@ defmodule Forgelet.Agent do
   Instructs the agent to claim an intent by reference.
   Returns `{:ok, event_ref}` on success.
   """
-  def claim_intent(agent_id, intent_ref, scope \\ nil) do
-    GenServer.call(via(agent_id), {:claim_intent, intent_ref, scope})
+  def claim_intent(agent_id, intent_ref) do
+    GenServer.call(via(agent_id), {:claim_intent_legacy, intent_ref, nil})
+  end
+
+  def claim_intent(agent_id, intent_ref, {:repo, _repo_id} = scope) do
+    GenServer.call(via(agent_id), {:claim_intent_legacy, intent_ref, scope})
+  end
+
+  def claim_intent(agent_id, repo_id, intent_ref) do
+    GenServer.call(via(agent_id), {:claim_intent, repo_id, intent_ref, nil})
+  end
+
+  def claim_intent(agent_id, repo_id, intent_ref, scope) do
+    GenServer.call(via(agent_id), {:claim_intent, repo_id, intent_ref, scope})
   end
 
   @doc """
@@ -73,11 +86,32 @@ defmodule Forgelet.Agent do
   end
 
   @doc """
+  Starts an autonomous Claude session for the agent.
+  """
+  def start_session(agent_id, opts \\ []) do
+    GenServer.call(via(agent_id), {:start_session, opts})
+  end
+
+  @doc """
   Instructs the agent to cast a vote on a proposal.
   Returns `{:ok, event_ref}` on success.
   """
   def vote(agent_id, proposal_ref, verdict, opts \\ []) do
     GenServer.call(via(agent_id), {:vote, proposal_ref, verdict, opts})
+  end
+
+  @doc """
+  Publishes a repository-scoped intent using the agent's identity.
+  """
+  def publish_intent(agent_id, repo_id, payload) do
+    GenServer.call(via(agent_id), {:publish_intent, repo_id, payload})
+  end
+
+  @doc """
+  Publishes a repository-scoped review comment.
+  """
+  def publish_comment(agent_id, payload, scope) do
+    GenServer.call(via(agent_id), {:publish_comment, payload, scope})
   end
 
   @doc """
@@ -118,6 +152,9 @@ defmodule Forgelet.Agent do
        provenance: nil,
        capabilities: [],
        current_task: nil,
+       active_session: nil,
+       last_session_status: nil,
+       last_session_output: nil,
        reputation: 0.5,
        status: :idle,
        model: Keyword.get(opts, :model),
@@ -130,13 +167,7 @@ defmodule Forgelet.Agent do
   def handle_info(:publish_joined, state) do
     case Event.new(:agent_joined, state.keypair, %{"kind" => to_string(state.kind)}) do
       {:ok, joined_event} ->
-        case EventStore.append(joined_event) do
-          {:ok, _} ->
-            :ok
-
-          {:error, reason} ->
-            Logger.warning("Agent: failed to append agent_joined: #{inspect(reason)}")
-        end
+        safe_append(joined_event, "agent_joined")
 
       {:error, reason} ->
         Logger.warning("Agent: failed to create agent_joined event: #{inspect(reason)}")
@@ -179,13 +210,7 @@ defmodule Forgelet.Agent do
 
         case Event.new(:agent_provenance, state.keypair, prov_payload) do
           {:ok, prov_event} ->
-            case EventStore.append(prov_event) do
-              {:ok, _} ->
-                :ok
-
-              {:error, reason} ->
-                Logger.warning("Agent: failed to append provenance: #{inspect(reason)}")
-            end
+            safe_append(prov_event, "agent_provenance")
 
           {:error, reason} ->
             Logger.warning("Agent: failed to create provenance event: #{inspect(reason)}")
@@ -204,11 +229,32 @@ defmodule Forgelet.Agent do
     # Only reset if this consensus is about our current task
     proposal_ref = event.payload["proposal_ref"]
 
-    if state.current_task && state.current_task == proposal_ref do
+    if match?(%{kind: :proposal, ref: ^proposal_ref}, state.current_task) do
       {:noreply, %{state | status: :idle, current_task: nil}}
     else
       {:noreply, state}
     end
+  end
+
+  @impl true
+  def handle_info({:session_ended, _session_pid, session_status, output}, state) do
+    publish_session_event(state, session_status, output)
+
+    next_status =
+      if is_nil(state.current_task) do
+        :idle
+      else
+        state.status
+      end
+
+    {:noreply,
+     %{
+       state
+       | active_session: nil,
+         status: next_status,
+         last_session_status: session_status,
+         last_session_output: output
+     }}
   end
 
   @impl true
@@ -229,25 +275,49 @@ defmodule Forgelet.Agent do
   end
 
   @impl true
-  def handle_call({:claim_intent, intent_ref, scope}, _from, state) do
-    opts =
-      if scope,
-        do: [scope: scope, references: [{:intent, intent_ref}]],
-        else: [references: [{:intent, intent_ref}]]
+  def handle_call({:claim_intent_legacy, intent_ref, scope}, _from, state) do
+    repo_id =
+      case scope do
+        {:repo, repo_id} -> repo_id
+        _ -> nil
+      end
 
-    case Event.new(:intent_claimed, state.keypair, %{"intent_ref" => intent_ref}, opts) do
-      {:ok, event} ->
-        case EventStore.append(event) do
-          {:ok, stored} ->
-            {:reply, {:ok, Event.ref(stored)},
-             %{state | status: :working, current_task: intent_ref}}
+    do_claim_intent(state, repo_id, intent_ref, scope)
+  end
 
+  @impl true
+  def handle_call({:claim_intent, repo_id, intent_ref, scope}, _from, state) do
+    do_claim_intent(state, repo_id, intent_ref, scope)
+  end
+
+  @impl true
+  def handle_call({:start_session, opts}, _from, state) do
+    cond do
+      state.active_session ->
+        {:reply, {:error, :session_already_active}, state}
+
+      state.status not in [:idle, :working] ->
+        {:reply, {:error, :agent_unavailable}, state}
+
+      true ->
+        with {:ok, task_context} <- TaskContext.resolve(state),
+             {:ok, session_pid, session_token} <-
+               Forgelet.Agent.Session.start_for_agent(
+                 self(),
+                 state.keypair.public,
+                 state.kind,
+                 Keyword.put(opts, :task_context, task_context)
+               ) do
+          {:reply, {:ok, session_pid, session_token},
+           %{
+             state
+             | active_session: %{pid: session_pid, token: session_token},
+               status: :working
+           }}
+        else
           {:error, _} = error ->
             {:reply, error, state}
         end
-
-      {:error, _} = error ->
-        {:reply, error, state}
     end
   end
 
@@ -266,10 +336,45 @@ defmodule Forgelet.Agent do
       {:ok, event} ->
         case EventStore.append(event) do
           {:ok, stored} ->
-            {:reply, {:ok, Event.ref(stored)}, state}
+            repo_id =
+              case scope do
+                {:repo, scoped_repo_id} -> scoped_repo_id
+                _ -> Map.get(payload, "repo_id")
+              end
+
+            {:reply, {:ok, Event.ref(stored)},
+             %{
+               state
+               | current_task: %{repo_id: repo_id, kind: :proposal, ref: Event.ref(stored)},
+                 status: :working
+             }}
 
           {:error, _} = error ->
             {:reply, error, state}
+        end
+
+      {:error, _} = error ->
+        {:reply, error, state}
+    end
+  end
+
+  @impl true
+  def handle_call({:publish_intent, repo_id, payload}, _from, state) do
+    case Forgelet.Repository.publish_intent(repo_id, state.keypair, payload) do
+      {:ok, event} -> {:reply, {:ok, Event.ref(event)}, state}
+      {:error, _} = error -> {:reply, error, state}
+    end
+  end
+
+  @impl true
+  def handle_call({:publish_comment, payload, scope}, _from, state) do
+    opts = if scope, do: [scope: scope], else: []
+
+    case Event.new(:comment_added, state.keypair, payload, opts) do
+      {:ok, event} ->
+        case EventStore.append(event) do
+          {:ok, stored} -> {:reply, {:ok, Event.ref(stored)}, state}
+          {:error, _} = error -> {:reply, error, state}
         end
 
       {:error, _} = error ->
@@ -309,7 +414,97 @@ defmodule Forgelet.Agent do
 
   @impl true
   def handle_call(:inspect_state, _from, state) do
-    sanitized = Map.put(state, :keypair, %{public: state.keypair.public})
+    sanitized =
+      state
+      |> Map.put(:keypair, %{public: state.keypair.public})
+      |> Map.update!(:active_session, fn
+        nil -> nil
+        session -> Map.delete(session, :pid)
+      end)
+
     {:reply, sanitized, state}
+  end
+
+  defp do_claim_intent(state, repo_id, intent_ref, scope) do
+    opts =
+      if scope,
+        do: [scope: scope, references: [{:intent, intent_ref}]],
+        else: [references: [{:intent, intent_ref}]]
+
+    with :ok <- maybe_reserve_claim(repo_id, intent_ref, state.keypair.public),
+         {:ok, event} <-
+           Event.new(:intent_claimed, state.keypair, %{"intent_ref" => intent_ref}, opts) do
+      case EventStore.append(event) do
+        {:ok, stored} ->
+          {:reply, {:ok, Event.ref(stored)},
+           %{
+             state
+             | status: :working,
+               current_task: %{repo_id: repo_id, kind: :intent, ref: intent_ref}
+           }}
+
+        {:error, _} = error ->
+          :ok = maybe_release_claim(repo_id, intent_ref, state.keypair.public)
+          {:reply, error, state}
+      end
+    else
+      {:error, _} = error ->
+        {:reply, error, state}
+
+      :ok ->
+        {:reply, {:error, :unexpected_reservation_result}, state}
+
+      other ->
+        {:reply, other, state}
+    end
+  end
+
+  defp maybe_reserve_claim(nil, _intent_ref, _agent_id), do: :ok
+
+  defp maybe_reserve_claim(repo_id, intent_ref, agent_id) do
+    Forgelet.Repository.reserve_intent_claim(repo_id, intent_ref, agent_id)
+  end
+
+  defp maybe_release_claim(nil, _intent_ref, _agent_id), do: :ok
+
+  defp maybe_release_claim(repo_id, intent_ref, agent_id) do
+    Forgelet.Repository.release_intent_claim(repo_id, intent_ref, agent_id)
+  end
+
+  defp publish_session_event(state, session_status, output) do
+    event_kind =
+      case session_status do
+        :completed -> :session_completed
+        _ -> :session_failed
+      end
+
+    payload = %{
+      "status" => to_string(session_status),
+      "summary" => String.slice(output || "", 0, 500),
+      "task_ref" => state.current_task && state.current_task.ref
+    }
+
+    case Event.new(event_kind, state.keypair, payload) do
+      {:ok, event} ->
+        safe_append(event, Atom.to_string(event_kind))
+        :ok
+
+      {:error, _reason} ->
+        :ok
+    end
+  end
+
+  defp safe_append(event, label) do
+    case EventStore.append(event) do
+      {:ok, _} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("Agent: failed to append #{label}: #{inspect(reason)}")
+    end
+  catch
+    :exit, reason ->
+      Logger.warning("Agent: append #{label} exited: #{inspect(reason)}")
+      :ok
   end
 end

@@ -1,7 +1,7 @@
 defmodule Forgelet.AgentTest do
   use Forgelet.DataCase
 
-  alias Forgelet.{Agent, EventStore}
+  alias Forgelet.{Agent, EventStore, Identity, Repository, Event}
 
   describe "spawn/2" do
     test "starts process and publishes events" do
@@ -54,11 +54,14 @@ defmodule Forgelet.AgentTest do
   describe "claim_intent/3" do
     test "publishes intent_claimed event and returns ref" do
       {:ok, _pid, public_key} = Agent.spawn(:coder)
+      owner = Identity.generate()
+      {:ok, _repo_pid, repo_id} = Repository.create("claim-repo", owner)
 
       Process.sleep(100)
 
-      fake_ref = Base.encode16(:crypto.strong_rand_bytes(16), case: :lower)
-      assert {:ok, _event_ref} = Agent.claim_intent(public_key, fake_ref)
+      {:ok, intent_event} = Repository.publish_intent(repo_id, owner, %{"title" => "Claim me"})
+      fake_ref = Event.ref(intent_event)
+      assert {:ok, _event_ref} = Agent.claim_intent(public_key, repo_id, fake_ref)
 
       Process.sleep(100)
 
@@ -71,11 +74,16 @@ defmodule Forgelet.AgentTest do
 
     test "sets scope when provided" do
       {:ok, _pid, public_key} = Agent.spawn(:coder)
-      scope = {:repo, :crypto.strong_rand_bytes(32)}
+      owner = Identity.generate()
+      {:ok, _repo_pid, repo_id} = Repository.create("claim-scope-repo", owner)
+      scope = {:repo, repo_id}
 
       Process.sleep(100)
 
-      fake_ref = Base.encode16(:crypto.strong_rand_bytes(16), case: :lower)
+      {:ok, intent_event} =
+        Repository.publish_intent(repo_id, owner, %{"title" => "Scoped claim"})
+
+      fake_ref = Event.ref(intent_event)
       assert {:ok, _event_ref} = Agent.claim_intent(public_key, fake_ref, scope)
 
       Process.sleep(100)
@@ -83,6 +91,20 @@ defmodule Forgelet.AgentTest do
       claimed_events = EventStore.by_kind(:intent_claimed)
       event = Enum.find(claimed_events, &(&1.author == public_key))
       assert event.scope == scope
+    end
+
+    test "rejects duplicate claims for the same repo intent" do
+      owner = Identity.generate()
+      {:ok, _repo_pid, repo_id} = Repository.create("duplicate-claim-repo", owner)
+      {:ok, intent_event} = Repository.publish_intent(repo_id, owner, %{"title" => "Only once"})
+      intent_ref = Event.ref(intent_event)
+      {:ok, _pid1, pk1} = Agent.spawn(:coder)
+      {:ok, _pid2, pk2} = Agent.spawn(:coder)
+
+      Process.sleep(100)
+
+      assert {:ok, _event_ref} = Agent.claim_intent(pk1, repo_id, intent_ref)
+      assert {:error, :already_claimed} = Agent.claim_intent(pk2, repo_id, intent_ref)
     end
   end
 

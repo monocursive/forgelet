@@ -23,6 +23,8 @@ services:
       DB_HOST: db
       PHX_IP: "0.0.0.0"
       MIX_ENV: dev
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      CLAUDE_CLI_PATH: /usr/local/bin/claude
     ports:
       - "4000:4000"
     volumes:
