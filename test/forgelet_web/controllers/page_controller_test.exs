@@ -1,8 +1,10 @@
 defmodule ForgeletWeb.PageControllerTest do
   use ForgeletWeb.ConnCase
 
-  test "GET /", %{conn: conn} do
-    conn = get(conn, ~p"/")
-    assert html_response(conn, 200) =~ "Peace of mind from prototype to production"
+  import Phoenix.LiveViewTest
+
+  test "GET / redirects to dashboard live view", %{conn: conn} do
+    {:ok, _view, html} = live(conn, "/")
+    assert html =~ "Mission Control"
   end
 end

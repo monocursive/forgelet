@@ -17,7 +17,13 @@ defmodule ForgeletWeb.Router do
   scope "/", ForgeletWeb do
     pipe_through :browser
 
-    get "/", PageController, :home
+    live "/", DashboardLive
+    live "/events", EventFeedLive
+    live "/agents", AgentListLive
+    live "/agents/:id", AgentDetailLive
+    live "/repos", RepoListLive
+    live "/repos/:id", RepoDetailLive
+    live "/consensus", ConsensusLive
   end
 
   # Other scopes may use custom stacks.
