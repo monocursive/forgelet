@@ -9,7 +9,10 @@ import Config
 
 config :forgelet,
   ecto_repos: [Forgelet.Repo],
-  generators: [timestamp_type: :utc_datetime]
+  generators: [timestamp_type: :utc_datetime, binary_id: true],
+  repo_base_path: Path.expand("../priv/repos", __DIR__),
+  bootstrap_peers: [],
+  default_consensus_policy: {:threshold, 2, 0.7}
 
 # Configure the endpoint
 config :forgelet, ForgeletWeb.Endpoint,

@@ -1,6 +1,4 @@
 defmodule Forgelet.Application do
-  # See https://hexdocs.pm/elixir/Application.html
-  # for more information on OTP Applications
   @moduledoc false
 
   use Application
@@ -12,20 +10,21 @@ defmodule Forgelet.Application do
       Forgelet.Repo,
       {DNSCluster, query: Application.get_env(:forgelet, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: Forgelet.PubSub},
-      # Start a worker by calling: Forgelet.Worker.start_link(arg)
-      # {Forgelet.Worker, arg},
-      # Start to serve requests, typically the last entry
+      Forgelet.Identity.Vault,
+      Forgelet.EventStore,
+      {Horde.Registry, name: Forgelet.Registry, keys: :unique, members: :auto},
+      {Horde.DynamicSupervisor,
+       name: Forgelet.AgentSupervisor, strategy: :one_for_one, members: :auto},
+      {Horde.DynamicSupervisor,
+       name: Forgelet.RepoSupervisor, strategy: :one_for_one, members: :auto},
+      Forgelet.Consensus.Engine,
       ForgeletWeb.Endpoint
     ]
 
-    # See https://hexdocs.pm/elixir/Supervisor.html
-    # for other strategies and supported options
     opts = [strategy: :one_for_one, name: Forgelet.Supervisor]
     Supervisor.start_link(children, opts)
   end
 
-  # Tell Phoenix to update the endpoint configuration
-  # whenever the application is updated.
   @impl true
   def config_change(changed, _new, removed) do
     ForgeletWeb.Endpoint.config_change(changed, removed)

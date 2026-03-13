@@ -8,7 +8,7 @@ import Config
 config :forgelet, Forgelet.Repo,
   username: "postgres",
   password: "postgres",
-  hostname: "localhost",
+  hostname: System.get_env("DB_HOST", "localhost"),
   database: "forgelet_test#{System.get_env("MIX_TEST_PARTITION")}",
   pool: Ecto.Adapters.SQL.Sandbox,
   pool_size: System.schedulers_online() * 2
@@ -39,3 +39,8 @@ config :phoenix_live_view,
 # Sort query params output of verified routes for robust url comparisons
 config :phoenix,
   sort_verified_routes_query_params: true
+
+# Forgelet test overrides
+config :forgelet,
+  repo_base_path: Path.expand("../tmp/test_repos", __DIR__),
+  default_consensus_policy: {:threshold, 2, 0.7}

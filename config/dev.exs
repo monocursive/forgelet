@@ -4,7 +4,7 @@ import Config
 config :forgelet, Forgelet.Repo,
   username: "postgres",
   password: "postgres",
-  hostname: "localhost",
+  hostname: System.get_env("DB_HOST", "localhost"),
   database: "forgelet_dev",
   stacktrace: true,
   show_sensitive_data_on_connection_error: true,
@@ -19,7 +19,7 @@ config :forgelet, Forgelet.Repo,
 config :forgelet, ForgeletWeb.Endpoint,
   # Binding to loopback ipv4 address prevents access from other machines.
   # Change to `ip: {0, 0, 0, 0}` to allow access from other machines.
-  http: [ip: {127, 0, 0, 1}],
+  http: [ip: if(System.get_env("PHX_IP") == "0.0.0.0", do: {0, 0, 0, 0}, else: {127, 0, 0, 1})],
   check_origin: false,
   code_reloader: true,
   debug_errors: true,
@@ -58,12 +58,12 @@ config :forgelet, ForgeletWeb.Endpoint,
     web_console_logger: true,
     patterns: [
       # Static assets, except user uploads
-      ~r"priv/static/(?!uploads/).*\.(js|css|png|jpeg|jpg|gif|svg)$"E,
+      ~r"priv/static/(?!uploads/).*\.(js|css|png|jpeg|jpg|gif|svg)$",
       # Gettext translations
-      ~r"priv/gettext/.*\.po$"E,
+      ~r"priv/gettext/.*\.po$",
       # Router, Controllers, LiveViews and LiveComponents
-      ~r"lib/forgelet_web/router\.ex$"E,
-      ~r"lib/forgelet_web/(controllers|live|components)/.*\.(ex|heex)$"E
+      ~r"lib/forgelet_web/router\.ex$",
+      ~r"lib/forgelet_web/(controllers|live|components)/.*\.(ex|heex)$"
     ]
   ]
 
