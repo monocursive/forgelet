@@ -14,6 +14,12 @@ defmodule ForgeletWeb.Router do
     plug :accepts, ["json"]
   end
 
+  scope "/mcp", ForgeletWeb.MCP do
+    pipe_through :api
+
+    post "/:token", Plug, []
+  end
+
   scope "/", ForgeletWeb do
     pipe_through :browser
 
